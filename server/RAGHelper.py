@@ -394,6 +394,10 @@ class RAGHelper:
             [x.page_content for x in self.chunked_documents],
             metadatas=[x.metadata for x in self.chunked_documents]
         )
+    def _initialize_colbert_reranker(self):
+        self.logger.info("Initializing ColBERT reranker.")
+        self.colbert_model = ColBERT.from_pretrained("bert-base-uncased")
+        self.colbert_searcher = Searcher(self.colbert_model, index_path=self.vector_store_uri)
 
     def _initialize_postgresbm25retriever(self):
         """Initializes in memory PostgresBM25Retriever."""
@@ -420,6 +424,17 @@ class RAGHelper:
 
     def _initialize_reranker(self):
         """Initialize the reranking model based on environment settings."""
+        super()._initialize_reranker()  # Call the parent logic for other rerankers
+
+        if hasattr(self, 'colbert_searcher'):
+            self.logger.info("Setting up ColBERT reranking.")
+            def colbert_rerank(query, documents):
+                doc_ids = [doc.metadata["id"] for doc in documents]
+                scores = self.colbert_searcher.rank(query, doc_ids)
+                ranked_docs = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
+                return [doc for doc, _ in ranked_docs[:self.rerank_k]]
+
+            self.rerank_retriever = colbert_rerank
         if self.rerank_model == "flashrank":
             self.logger.info("Setting up the FlashrankRerank.")
             self.compressor = FlashrankRerank(top_n=self.rerank_k)
@@ -435,17 +450,16 @@ class RAGHelper:
         )
 
     def _setup_retrievers(self):
-        """Sets up the retrievers based on specified configurations."""
-        self._initialize_retrievers()
-        # Set up the vector retriever
-        self.logger.info("Setting up the Vector Retriever.")
-        retriever = self.db.as_retriever(
-            search_type="mmr", search_kwargs={'k': self.vector_store_k}
-        )
-        self.logger.info("Setting up the hybrid retriever.")
-        self.ensemble_retriever = EnsembleRetriever(
-            retrievers=[self.sparse_retriever, retriever], weights=[0.5, 0.5]
-        )
+        super()._setup_retrievers()  # Call the parent logic for other retrievers
+        
+        if hasattr(self, 'colbert_searcher'):
+            self.logger.info("Setting up ColBERT retriever.")
+            def colbert_retriever(query, k=self.vector_store_k):
+                return self.colbert_searcher.search(query, k=k)
+
+            # Adding ColBERT to the ensemble
+            self.ensemble_retriever.retrievers.append(colbert_retriever)
+            self.ensemble_retriever.weights.append(0.5)
         if self.rerank:
             self._initialize_reranker()
 
@@ -461,7 +475,14 @@ class RAGHelper:
                 pickle.dump(self.chunked_documents, f)
 
     def _add_to_vector_database(self, new_chunks):
+        
         """Add the new document chunks to the vector database."""
+        super()._add_to_vector_database(new_chunks)  # Call the parent logic for other retrievers
+
+        if hasattr(self, 'colbert_searcher'):
+            documents = [(d.metadata["id"], d.page_content) for d in new_chunks]
+            for doc_id, content in documents:
+                self.colbert_searcher.index_document(doc_id, content)
         if not self.db:
             self._initialize_vector_store()
 
